@@ -16,14 +16,6 @@
 
 #define WEAK                    __attribute__((weak))
 
-// IRQ Numbers
-#define IRQ_S_SOFT              1
-#define IRQ_M_SOFT              3
-#define IRQ_S_TIMER             5
-#define IRQ_M_TIMER             7
-#define IRQ_S_EXT               9
-#define IRQ_M_EXT               11
-
 // Preempt rate
 #define TICK_RATE_HZ            1000
 
@@ -31,7 +23,8 @@
 // Locals:
 //-----------------------------------------------------------------
 // Detect recursive interrupts (which are not supported)
-static volatile uint32_t _in_interrupt = 0;
+static volatile uint32_t _in_interrupt    = 0;
+static fp_irq            _platform_irq_cb = 0;
 
 //-----------------------------------------------------------------
 // cpu_thread_init_tcb: Initialise thread context
@@ -161,12 +154,11 @@ static CRITICALFUNC struct irq_context * cpu_syscall(struct irq_context *ctx)
     return ctx;
 }
 //-----------------------------------------------------------------
-// cpu_irq: Handle (timer) interrupt exception
+// cpu_timer_irq: Handle (timer) interrupt exception
 //-----------------------------------------------------------------
-static CRITICALFUNC struct irq_context * cpu_irq(struct irq_context *ctx)
+static CRITICALFUNC struct irq_context * cpu_timer_irq(struct irq_context *ctx)
 {
     struct thread* thread;
-    int irq = ctx->cause & 0x7FFFFFFF;
 
     // Check that this not occuring recursively!
     OS_ASSERT(!_in_interrupt);
@@ -186,23 +178,16 @@ static CRITICALFUNC struct irq_context * cpu_irq(struct irq_context *ctx)
         OS_ASSERT(thread->tcb.stack_alloc[0] == STACK_CHK_BYTE);
     }
 
-    if (irq == IRQ_M_TIMER)
-    {
-        // Handle thread scheduling
-        thread_tick();
+    // Handle thread scheduling
+    thread_tick();
 
-        // Reset timer (ack pending interrupt)
-        timer_set_mtimecmp(timer_get_mtime() + (MCU_CLK/TICK_RATE_HZ));
-        csr_clear(mip, SR_IP_MTIP);
-        csr_set(mie, SR_IP_MTIP);
-        
-        // Load new thread context
-        thread_load_context(1);
-    }
-    else
-    {
-        OS_ASSERT(!"Not supported");
-    }
+    // Reset timer (ack pending interrupt)
+    timer_set_mtimecmp(timer_get_mtime() + (MCU_CLK/TICK_RATE_HZ));
+    csr_clear(mip, SR_IP_MTIP);
+    csr_set(mie, SR_IP_MTIP);
+    
+    // Load new thread context
+    thread_load_context(1);
 
     // Get stack frame of new thread
     thread = thread_current();
@@ -216,13 +201,31 @@ static CRITICALFUNC struct irq_context * cpu_irq(struct irq_context *ctx)
     return ctx;
 }
 //-----------------------------------------------------------------
+// cpu_irq_wrapper: Handle (external) interrupt exception
+//-----------------------------------------------------------------
+static CRITICALFUNC struct irq_context * cpu_irq_wrapper(struct irq_context *ctx)
+{
+    OS_ASSERT(_platform_irq_cb);
+
+    // Check that this not occuring recursively!
+    OS_ASSERT(!_in_interrupt);
+    _in_interrupt = 1;
+    ctx = _platform_irq_cb(ctx);
+    _in_interrupt = 0;
+
+    return ctx;
+}
+//-----------------------------------------------------------------
 // cpu_thread_start:
 //-----------------------------------------------------------------
 void cpu_thread_start( void )
 {
     // Fault handlers
     exception_set_syscall_handler(cpu_syscall);
-    exception_set_irq_handler(cpu_irq);
+    exception_set_timer_handler(cpu_timer_irq);
+
+    _platform_irq_cb = exception_get_irq_handler();
+    exception_set_irq_handler(cpu_irq_wrapper);
 
     // Make sure current IRQ enable is disabled
     csr_clr_irq_enable();
